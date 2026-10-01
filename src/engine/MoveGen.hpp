@@ -1089,7 +1089,7 @@ namespace Shaktris {
                             ret.position.y--;
 							break;
 						case 3:
-                            ret.position.x++;
+                            ret.position.x--;
                             ret.rot = 1;
 							break;
 						}
