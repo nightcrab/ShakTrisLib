@@ -995,7 +995,7 @@ namespace Shaktris {
                             (i8)(*prev_offsets)[p.rot][i].x - (i8)(*offsets)[static_cast<size_t>(new_rot)][i].x,
                             (i8)(*prev_offsets)[p.rot][i].y - (i8)(*offsets)[static_cast<size_t>(new_rot)][i].y);
 
-                        SmearedPiece ret = p;
+                        ret = p;
                         ret.position.x += offset.x;
                         ret.position.y += offset.y;
                         ret.rot = new_rot;
