@@ -1158,7 +1158,14 @@ namespace Shaktris {
                         open_nodes.push_back(SmearedPiece{piece.position, (u8)piece.rotation});
                     }
                 } else {
-                    open_nodes.push_back({Coord((i8)4, (i8)19), 0});
+                    // raise the spawn while it's blocked, like games do, instead of searching from inside the stack
+                    const auto spawn_col = s_board.boards[0].board[4];
+                    int spawn_y = 19;
+                    while (spawn_y < Board::height - 1 && (spawn_col >> spawn_y) & 1)
+                        ++spawn_y;
+                    if ((spawn_col >> spawn_y) & 1)
+                        return ret;
+                    open_nodes.push_back({Coord((i8)4, (i8)spawn_y), 0});
                 }
 
                 while (true) {
