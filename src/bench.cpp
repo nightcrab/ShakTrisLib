@@ -14,6 +14,9 @@ using namespace Shaktris::MoveGen;
 
 static constexpr PieceType queue[] = { PieceType::I, PieceType::O, PieceType::T, PieceType::L, PieceType::J, PieceType::S, PieceType::Z };
 
+// deep enough to reach boards taller than the packed 16 bit flood fits
+static constexpr int check_depth = 5;
+
 struct Variant {
     std::string name;
     std::vector<Piece> (*gen)(const Board&, PieceType);
@@ -59,10 +62,10 @@ static uint64_t check(const Board& b, const PieceType* q, int depth, const Varia
     return bad;
 }
 
-template <class BB>
+template <class BB, bool Packed = Flood::use_packed16<BB>>
 static void add(std::vector<Variant>& out, const char* name) {
-    out.push_back({ std::string(name) + " vec", &Flood::movegen<BB>, nullptr });
-    out.push_back({ std::string(name) + " count", &Flood::movegen<BB>, &Flood::count<BB> });
+    out.push_back({ std::string(name) + " vec", &Flood::movegen<BB, Packed>, nullptr });
+    out.push_back({ std::string(name) + " count", &Flood::movegen<BB, Packed>, &Flood::count<BB, Packed> });
 }
 
 int main(int argc, char** argv) {
@@ -79,12 +82,15 @@ int main(int argc, char** argv) {
     add<Flood::ColBoardVec2>(variants, "ColBoardVec2");
 #endif
 #if defined(__AVX512F__)
-    add<Flood::ColBoard512>(variants, "ColBoard512");
+    add<Flood::ColBoard512, false>(variants, "ColBoard512");
+#endif
+#if defined(__AVX512BW__)
+    add<Flood::ColBoard512, true>(variants, "Packed16");
 #endif
 
     for (const Variant& v : variants) {
         uint64_t boards = 0;
-        const uint64_t bad = check(Board{}, queue, 4, v, boards);
+        const uint64_t bad = check(Board{}, queue, check_depth, v, boards);
         std::printf("check %-20s %llu / %llu boards differ from god_movegen_bfs\n", v.name.c_str(), (unsigned long long)bad, (unsigned long long)boards);
     }
 

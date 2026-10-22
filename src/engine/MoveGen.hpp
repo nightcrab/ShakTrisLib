@@ -7,6 +7,7 @@
 #include <ranges>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <bitset>
 #include <bit>
@@ -790,12 +791,15 @@ namespace Shaktris {
 
                 for (size_t rot = 0; rot < 4; rot++) {
                     for (const Coord& mino : rot_piece_def[static_cast<size_t>(type)][rot]) {
-                        for (size_t x = 0; x < Board::width; x++) {
-                            column_t c = thick_board[2 + x + mino.x];
-                            bool cond = (mino.y < 0);
-                            c = ((!cond) * (c >> mino.y)) | (cond * ~(~c << -mino.y));
-
-                            ret.boards[rot].board[x] |= c;
+                        // two loops instead of a select inside one, so each still vectorizes
+                        if (mino.y >= 0) {
+                            for (size_t x = 0; x < Board::width; x++)
+                                ret.boards[rot].board[x] |= thick_board[2 + x + mino.x] >> mino.y;
+                        }
+                        else {
+                            // minos below the origin fill the bottom rows with collisions (the floor)
+                            for (size_t x = 0; x < Board::width; x++)
+                                ret.boards[rot].board[x] |= ~(~thick_board[2 + x + mino.x] << -mino.y);
                         }
                     }
                 }
@@ -813,7 +817,7 @@ namespace Shaktris {
                     bool cond = (board.board[x] >= std::numeric_limits<column_t>::max() >> 2);
 
                     auto height = (sizeof(column_t) * CHAR_BIT) - std::countl_zero(board.board[x]);
-                    ret.board[x] = (!cond) * (1 << height);  // set the column to the height
+                    ret.board[x] = cond ? 0 : column_t(1) << height;  // set the column to the height
                 }
 
                 return ret;
@@ -1264,6 +1268,15 @@ namespace Shaktris {
         namespace Flood {
             using Smeared::SmearedBoard;
 
+            // clang won't inline the big per-kick lambdas on its own, which spills the flood state every call
+#if !defined(SHAKTRIS_FORCE_INLINE)
+#if defined(__GNUC__) || defined(__clang__)
+#define SHAKTRIS_FORCE_INLINE __attribute__((always_inline))
+#else
+#define SHAKTRIS_FORCE_INLINE
+#endif
+#endif
+
             // board types: all hold one column_t per x for x < Board::width and keep every other lane zero.
             // simd boards get the slide and precomputed kick paths, which only pay off with real vector registers
 
@@ -1593,6 +1606,254 @@ namespace Shaktris {
             template <PieceType P>
             constexpr KickTable kick_table = make_kicks(P);
 
+            // rotation after turning from `from` in direction dir (0 = right, 1 = left), and the rotation that turns into `to`
+            constexpr size_t rot_to(size_t from, size_t dir) { return dir == 0 ? (from + 1) % 4 : (from + 3) % 4; }
+            constexpr size_t rot_from(size_t to, size_t dir) { return dir == 0 ? (to + 3) % 4 : (to + 1) % 4; }
+
+            // boards that get the packed 16 bit flood on top of their own, see Packed16
+            template <class BB>
+            constexpr bool use_packed16 = false;
+
+#if defined(__AVX512BW__)
+            // about 1.25x faster with gcc on zen 5, but about 1.13x slower with clang (cause unknown), so gcc only by default
+#if !defined(__clang__)
+            template <>
+            constexpr bool use_packed16<ColBoard512> = true;
+#endif
+
+            // the flood with 16 bit columns and two rotations per zmm: rotation r lives in register r / 2 at lanes
+            // (r % 2) * 16 + x, so every move covers all four rotations in two instructions.
+            // only boards whose flood stays below row 14 fit, the rest are left to the 32 bit flood
+            struct Packed16 {
+                // not std::array, which drops __m512i's attributes
+                struct Regs {
+                    __m512i r[2];
+                    inline __m512i& operator[](size_t i) { return r[i]; }
+                    inline const __m512i& operator[](size_t i) const { return r[i]; }
+                };
+
+                static constexpr __mmask32 lane_mask = 0x03FF03FF;
+                // rows 14 and 15: a kick moves up at most 2, so a flood that never reaches them can't have lost anything above 15
+                static constexpr u16 high_rows = 0xC000;
+
+                // where a destination lane takes its value from, see make_move
+                struct Src {
+                    size_t rot;
+                    int x;
+                    int dy;
+                };
+
+                // one masked vpermt2w with compile time indices plus per lane shifts, builds register R of the result
+                struct LaneMove {
+                    std::array<u16, 32> idx{}, shl{}, shr{};
+                    __mmask32 mask = 0;
+                    bool any_shl = false, any_shr = false;
+                };
+
+                template <class F>
+                static consteval LaneMove make_move(size_t R, F src) {
+                    LaneMove m;
+                    for (size_t l = 0; l < 32; ++l) {
+                        const size_t rot = 2 * R + l / 16;
+                        const int x = (int)(l % 16);
+                        if (x >= (int)Board::width)
+                            continue;
+                        const Src s = src(rot, x);
+                        if (s.x < 0 || s.x >= (int)Board::width)
+                            continue;
+                        m.idx[l] = (u16)((s.rot / 2) * 32 + (s.rot % 2) * 16 + (size_t)s.x);
+                        m.mask |= __mmask32(1) << l;
+                        if (s.dy > 0) { m.shl[l] = (u16)s.dy; m.any_shl = true; }
+                        if (s.dy < 0) { m.shr[l] = (u16)-s.dy; m.any_shr = true; }
+                    }
+                    return m;
+                }
+
+
+                // every rotation moved by (dx, 0)
+                template <int dx, size_t R>
+                static constexpr LaneMove slide_move = make_move(R, [](size_t rot, int x) { return Src{ rot, x - dx, 0 }; });
+
+                // kick I in direction D lands in the To rotation: position (x, y) came from (x - k.x, y - k.y) of From
+                template <PieceType P, size_t D, size_t I, size_t R>
+                static constexpr LaneMove kick_move = make_move(R, [](size_t to, int x) {
+                    const size_t from = rot_from(to, D);
+                    const Coord k = kick_table<P>[from][to][I];
+                    return Src{ from, x - k.x, k.y };
+                });
+
+                // the reverse: which From positions would fit after kick I in direction D
+                template <PieceType P, size_t D, size_t I, size_t R>
+                static constexpr LaneMove fit_move = make_move(R, [](size_t from, int x) {
+                    const size_t to = rot_to(from, D);
+                    const Coord k = kick_table<P>[from][to][I];
+                    return Src{ to, x + k.x, -k.y };
+                });
+
+                // rotations 2 and 3 moved onto their canonical rotations 0 and 1, see cannonicalize in god_movegen_bfs
+                template <PieceType P>
+                static constexpr LaneMove fold_move = make_move(0, [](size_t to, int x) {
+                    if constexpr (P == PieceType::I)
+                        return to == 0 ? Src{ 2, x + 1, 0 } : Src{ 3, x, 1 };
+                    else
+                        return to == 0 ? Src{ 2, x, -1 } : Src{ 3, x + 1, 0 };
+                });
+
+                template <const LaneMove& M>
+                SHAKTRIS_FORCE_INLINE static inline __m512i apply(const Regs& src) {
+                    __m512i v = _mm512_maskz_permutex2var_epi16(M.mask, src[0], _mm512_loadu_si512(M.idx.data()), src[1]);
+                    if constexpr (M.any_shl)
+                        v = _mm512_sllv_epi16(v, _mm512_loadu_si512(M.shl.data()));
+                    if constexpr (M.any_shr)
+                        v = _mm512_srlv_epi16(v, _mm512_loadu_si512(M.shr.data()));
+                    return v;
+                }
+
+                template <const LaneMove& M0, const LaneMove& M1>
+                SHAKTRIS_FORCE_INLINE static inline Regs apply2(const Regs& src) { return { apply<M0>(src), apply<M1>(src) }; }
+
+                template <int dx>
+                SHAKTRIS_FORCE_INLINE static inline Regs slide(const Regs& v) { return apply2<slide_move<dx, 0>, slide_move<dx, 1>>(v); }
+
+                static inline Regs and_(const Regs& a, const Regs& b) { return { _mm512_and_si512(a[0], b[0]), _mm512_and_si512(a[1], b[1]) }; }
+                static inline Regs or_(const Regs& a, const Regs& b) { return { _mm512_or_si512(a[0], b[0]), _mm512_or_si512(a[1], b[1]) }; }
+                static inline Regs andnot(const Regs& a, const Regs& b) { return { _mm512_andnot_si512(b[0], a[0]), _mm512_andnot_si512(b[1], a[1]) }; }
+                static inline bool any(const Regs& a) { return _mm512_test_epi64_mask(_mm512_or_si512(a[0], a[1]), _mm512_or_si512(a[0], a[1])) != 0; }
+
+                template <int dy>
+                static inline Regs shift_y(const Regs& a) {
+                    if constexpr (dy > 0) return { _mm512_slli_epi16(a[0], dy), _mm512_slli_epi16(a[1], dy) };
+                    else return { _mm512_srli_epi16(a[0], -dy), _mm512_srli_epi16(a[1], -dy) };
+                }
+
+                // 32 bit rotations r and r + 1 into one register, truncating every column to its low 16 rows
+                static inline __m512i pack(const ColBoard512& lo, const ColBoard512& hi) {
+                    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi32_epi16(lo.v)), _mm512_cvtepi32_epi16(hi.v), 1);
+                }
+
+                static inline void unpack(const Regs& p, std::array<ColBoard512, 4>& out) {
+                    for (size_t R = 0; R < 2; ++R) {
+                        out[2 * R] = { _mm512_cvtepu16_epi32(_mm512_castsi512_si256(p[R])) };
+                        out[2 * R + 1] = { _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(p[R], 1)) };
+                    }
+                }
+
+                // f.template operator()<D, I>() for every kick
+                template <class F>
+                SHAKTRIS_FORCE_INLINE static inline void for_each_kick(F&& f) {
+                    [&]<size_t... J>(std::index_sequence<J...>) SHAKTRIS_FORCE_INLINE {
+                        (f.template operator()<J / srs_kicks, J % srs_kicks>(), ...);
+                    }(std::make_index_sequence<2 * srs_kicks>{});
+                }
+
+                // same as Gen::placements, false if the board doesn't fit in 16 rows
+                template <PieceType P, bool WantSpin>
+                static inline bool placements(const SmearedBoard& s, const Board& board, std::array<ColBoard512, 4>& moves_out, std::array<ColBoard512, 4>& spin_out) {
+                    constexpr bool rotates = P != PieceType::O;
+                    if (!board.is_low())
+                        return false;
+
+                    // seeds as in Gen::placements, done in 32 bits since they decide whether the board fits
+                    constexpr size_t seeded = P == PieceType::O ? 1 : (P == PieceType::I || P == PieceType::S || P == PieceType::Z) ? 2 : 4;
+                    std::array<ColBoard512, 4> coll32, seed32{};
+                    __m512i seen = _mm512_setzero_si512();
+                    for (size_t r = 0; r < 4; ++r) {
+                        coll32[r] = ColBoard512::load(s.boards[r]);
+                        if (r < seeded) {
+                            seed32[r] = coll32[r].above_top();
+                            seen = _mm512_or_si512(seen, seed32[r].v);
+                        }
+                    }
+                    if (_mm512_test_epi32_mask(seen, _mm512_set1_epi32(~column_t(0) << 14)))
+                        return false;
+
+                    const Regs lanes = { _mm512_maskz_set1_epi16(lane_mask, -1), _mm512_maskz_set1_epi16(lane_mask, -1) };
+                    const Regs ones = { _mm512_maskz_set1_epi16(lane_mask, 1), _mm512_maskz_set1_epi16(lane_mask, 1) };
+                    const Regs coll = { pack(coll32[0], coll32[1]), pack(coll32[2], coll32[3]) };
+                    const Regs free = andnot(lanes, coll);
+                    const Regs ground = and_(free, or_(shift_y<1>(coll), ones));
+
+                    // free runs for the log-step drop and slides, see FloodBoard
+                    std::array<Regs, 4> fall, left, right;
+                    fall[0] = left[0] = right[0] = free;
+                    fall[1] = and_(fall[0], shift_y<-1>(fall[0]));
+                    fall[2] = and_(fall[1], shift_y<-2>(fall[1]));
+                    fall[3] = and_(fall[2], shift_y<-4>(fall[2]));
+                    left[1] = and_(left[0], slide<-1>(left[0]));
+                    left[2] = and_(left[1], slide<-2>(left[1]));
+                    left[3] = and_(left[2], slide<-4>(left[2]));
+                    right[1] = and_(right[0], slide<1>(right[0]));
+                    right[2] = and_(right[1], slide<2>(right[1]));
+                    right[3] = and_(right[2], slide<4>(right[2]));
+
+                    // src[D][I]: positions whose first fitting kick in direction D is I, in the From rotation's lanes
+                    std::array<std::array<Regs, srs_kicks>, 2> src;
+                    if constexpr (rotates) {
+                        std::array<Regs, 2> taken{};
+                        for_each_kick([&]<size_t D, size_t I>() SHAKTRIS_FORCE_INLINE {
+                            const Regs fits = apply2<fit_move<P, D, I, 0>, fit_move<P, D, I, 1>>(free);
+                            src[D][I] = andnot(fits, taken[D]);
+                            taken[D] = or_(taken[D], fits);
+                        });
+                    }
+
+                    Regs reach = { pack(seed32[0], seed32[1]), pack(seed32[2], seed32[3]) };
+                    Regs frontier = reach;
+                    while (true) {
+                        Regs l = frontier, rt = frontier, g = frontier;
+                        l = or_(l, and_(slide<-1>(l), left[0]));
+                        rt = or_(rt, and_(slide<1>(rt), right[0]));
+                        l = or_(l, and_(slide<-2>(l), left[1]));
+                        rt = or_(rt, and_(slide<2>(rt), right[1]));
+                        l = or_(l, and_(slide<-4>(l), left[2]));
+                        rt = or_(rt, and_(slide<4>(rt), right[2]));
+                        l = or_(l, and_(slide<-8>(l), left[3]));
+                        rt = or_(rt, and_(slide<8>(rt), right[3]));
+                        g = or_(g, and_(shift_y<-1>(g), fall[0]));
+                        g = or_(g, and_(shift_y<-2>(g), fall[1]));
+                        g = or_(g, and_(shift_y<-4>(g), fall[2]));
+                        g = or_(g, and_(shift_y<-8>(g), fall[3]));
+                        Regs next = or_(or_(l, rt), and_(g, ground));
+
+                        if constexpr (rotates) {
+                            for_each_kick([&]<size_t D, size_t I>() SHAKTRIS_FORCE_INLINE {
+                                const Regs from = and_(frontier, src[D][I]);
+                                next = or_(next, apply2<kick_move<P, D, I, 0>, kick_move<P, D, I, 1>>(from));
+                            });
+                        }
+
+                        next = andnot(next, reach);
+                        if (!any(next))
+                            break;
+                        reach = or_(reach, next);
+                        frontier = next;
+                    }
+
+                    const Regs high = { _mm512_maskz_set1_epi16(lane_mask, (short)high_rows), _mm512_maskz_set1_epi16(lane_mask, (short)high_rows) };
+                    if (any(and_(reach, high)))
+                        return false;
+
+                    Regs moves = and_(reach, ground);
+                    Regs spin{};
+                    if constexpr (WantSpin) {
+                        const Regs mobile = or_(or_(slide<1>(free), slide<-1>(free)), or_(shift_y<1>(free), shift_y<-1>(free)));
+                        spin = andnot(moves, mobile);
+                    }
+
+                    if constexpr (P == PieceType::I || P == PieceType::S || P == PieceType::Z) {
+                        moves = { _mm512_or_si512(moves[0], apply<fold_move<P>>(moves)), _mm512_setzero_si512() };
+                        if constexpr (WantSpin)
+                            spin = { _mm512_or_si512(spin[0], apply<fold_move<P>>(spin)), _mm512_setzero_si512() };
+                    }
+
+                    unpack(moves, moves_out);
+                    if constexpr (WantSpin)
+                        unpack(spin, spin_out);
+                    return true;
+                }
+            };
+#endif
+
             // per rotation masks derived from the smeared collision board
             template <class BB>
             struct FloodBoard {
@@ -1666,25 +1927,48 @@ namespace Shaktris {
                 }
             };
 
-            template <class BB>
+            // Smeared::smear with the piece known at compile time, so every mino shift is a constant
+            template <PieceType P>
+            inline SmearedBoard smear(const Board& board) {
+                SmearedBoard ret{};
+                // two walls of collisions on each side of the board
+                std::array<column_t, Board::width + 4> thick;
+                thick[0] = thick[1] = thick[Board::width + 2] = thick[Board::width + 3] = ~column_t(0);
+                for (size_t x = 0; x < Board::width; ++x)
+                    thick[x + 2] = board.board[x];
+
+                [&]<size_t... J>(std::index_sequence<J...>) SHAKTRIS_FORCE_INLINE {
+                    ([&] {
+                        constexpr size_t rot = J / n_minos;
+                        constexpr Coord mino = rot_piece_def[static_cast<size_t>(P)][rot][J % n_minos];
+                        for (size_t x = 0; x < Board::width; ++x) {
+                            const column_t c = thick[2 + x + mino.x];
+                            // minos below the origin fill the bottom rows with collisions (the floor)
+                            if constexpr (mino.y >= 0)
+                                ret.boards[rot].board[x] |= c >> mino.y;
+                            else
+                                ret.boards[rot].board[x] |= ~(~c << -mino.y);
+                        }
+                    }(), ...);
+                }(std::make_index_sequence<4 * n_minos>{});
+
+                return ret;
+            }
+
+            template <class BB, bool Packed = use_packed16<BB>>
             struct Gen {
-                // precomputing which kick every position takes makes the kicks independent of each other.
-                // that's about 1.3x faster with gcc and about 1.5x slower with clang, which then prefers the chained kicks
-#if defined(__clang__)
-                static constexpr bool pre_kicks = false;
-#else
+                // precomputing which kick every position takes makes the kicks independent of each other,
+                // which only pays off with real vector registers
                 static constexpr bool pre_kicks = BB::simd;
-#endif
 
                 // kick_src[from][dir][i]: positions whose first fitting kick is i, dir 0 = right, 1 = left
                 using KickSrc = std::array<std::array<std::array<BB, srs_kicks>, 2>, 4>;
 
-                static constexpr size_t rot_to(size_t from, size_t dir) { return dir == 0 ? (from + 1) % 4 : (from + 3) % 4; }
 
                 // f.template operator()<From, Dir, I>() for every kick
                 template <class F>
-                static inline void for_each_kick(F&& f) {
-                    [&]<size_t... J>(std::index_sequence<J...>) {
+                SHAKTRIS_FORCE_INLINE static inline void for_each_kick(F&& f) {
+                    [&]<size_t... J>(std::index_sequence<J...>) SHAKTRIS_FORCE_INLINE {
                         (f.template operator()<J / (2 * srs_kicks), (J / srs_kicks) % 2, J % srs_kicks>(), ...);
                     }(std::make_index_sequence<4 * 2 * srs_kicks>{});
                 }
@@ -1692,7 +1976,7 @@ namespace Shaktris {
                 template <PieceType P>
                 static inline void make_kick_src(const FloodBoard<BB>& fb, KickSrc& src) {
                     std::array<std::array<BB, 2>, 4> taken{};
-                    for_each_kick([&]<size_t From, size_t Dir, size_t I>() {
+                    for_each_kick([&]<size_t From, size_t Dir, size_t I>() SHAKTRIS_FORCE_INLINE {
                         constexpr Coord k = kick_table<P>[From][rot_to(From, Dir)][I];
                         const BB fits = fb.free[rot_to(From, Dir)].template shift<-k.x, -k.y>();
                         src[From][Dir][I] = fits.andnot(taken[From][Dir]);
@@ -1722,7 +2006,7 @@ namespace Shaktris {
                 template <PieceType P>
                 static inline void rotate(const std::array<BB, 4>& from, const FloodBoard<BB>& fb, const KickSrc& src, std::array<BB, 4>& next) {
                     if constexpr (pre_kicks) {
-                        for_each_kick([&]<size_t From, size_t Dir, size_t I>() {
+                        for_each_kick([&]<size_t From, size_t Dir, size_t I>() SHAKTRIS_FORCE_INLINE {
                             constexpr Coord k = kick_table<P>[From][rot_to(From, Dir)][I];
                             next[rot_to(From, Dir)] |= (from[From] & src[From][Dir][I]).template shift<k.x, k.y>();
                         });
@@ -1811,17 +2095,29 @@ namespace Shaktris {
                         canonicalize<P>(spin);
                 }
 
+                // the packed 16 bit flood when the board fits, the full one otherwise
+                template <PieceType P, bool WantSpin>
+                static inline void flood(const SmearedBoard& s, const Board& board, std::array<BB, 4>& moves, std::array<BB, 4>& spin) {
+#if defined(__AVX512BW__)
+                    if constexpr (Packed) {
+                        if (Packed16::placements<P, WantSpin>(s, board, moves, spin))
+                            return;
+                    }
+#endif
+                    placements<P, WantSpin>(s, board, moves, spin);
+                }
+
                 template <PieceType P>
                 static inline std::vector<Piece> movegen(const Board& board) {
                     if (board.surface_convex() && board.is_low())
                         return Smeared::moves_to_vec(Smeared::convex_movegen(board, P), P);
 
-                    const SmearedBoard s = Smeared::smear(board, P);
+                    const SmearedBoard s = smear<P>(board);
                     if (s.convex(PieceType::O == P))
                         return Smeared::moves_to_vec(convex_moves(s, P), P);
 
                     std::array<BB, 4> moves, spin;
-                    placements<P, true>(s, board, moves, spin);
+                    flood<P, true>(s, board, moves, spin);
 
                     std::vector<Piece> ret;
                     ret.reserve(150);
@@ -1845,12 +2141,12 @@ namespace Shaktris {
                     if (board.surface_convex() && board.is_low())
                         return popcount(Smeared::convex_movegen(board, P));
 
-                    const SmearedBoard s = Smeared::smear(board, P);
+                    const SmearedBoard s = smear<P>(board);
                     if (s.convex(PieceType::O == P))
                         return popcount(convex_moves(s, P));
 
                     std::array<BB, 4> moves, spin;
-                    placements<P, false>(s, board, moves, spin);
+                    flood<P, false>(s, board, moves, spin);
                     size_t n = 0;
                     for (const BB& m : moves)
                         n += m.popcount();
@@ -1892,14 +2188,14 @@ namespace Shaktris {
                 }
             }
 
-            template <class BB = DefaultBoard>
+            template <class BB = DefaultBoard, bool Packed = use_packed16<BB>>
             inline std::vector<Piece> movegen(const Board& board, PieceType type) {
-                return with_piece(type, [&]<PieceType P>() { return Gen<BB>::template movegen<P>(board); });
+                return with_piece(type, [&]<PieceType P>() { return Gen<BB, Packed>::template movegen<P>(board); });
             }
 
-            template <class BB = DefaultBoard>
+            template <class BB = DefaultBoard, bool Packed = use_packed16<BB>>
             inline size_t count(const Board& board, PieceType type) {
-                return with_piece(type, [&]<PieceType P>() { return Gen<BB>::template count<P>(board); });
+                return with_piece(type, [&]<PieceType P>() { return Gen<BB, Packed>::template count<P>(board); });
             }
         }; // namespace Flood
 
