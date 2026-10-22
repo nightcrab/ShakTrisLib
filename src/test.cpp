@@ -59,14 +59,15 @@ template <std::size_t N>
 static Nodes perft(Board board, const Piece& move, const std::array<PieceType, N>& queue, int i, int depth) {
     using namespace Shaktris::MoveGen::Smeared;
 
+    board.set(move);
+    board.clearLines();
+
     if (depth <= 1) {
-        return god_movegen(board, queue[i]).size();
+        return god_movegen_count(board, queue[i]);
     }
 
     Nodes nodes = 0;
 
-    board.set(move);
-    board.clearLines();
     for (auto& move : god_movegen(board, queue[i]))
         nodes += perft(board, move, queue, i + 1, depth - 1);
 
@@ -78,7 +79,7 @@ static Nodes perft(Board& board, const std::array<PieceType, N>& queue, int dept
     using namespace Shaktris::MoveGen::Smeared;
 
     if (depth <= 1)
-        return god_movegen(board, queue[0]).size();
+        return god_movegen_count(board, queue[0]);
 
     Nodes nodes = 0;
 
@@ -269,7 +270,7 @@ void kise() {
 }
 
 int main() {
-    Citrus();
+    kise();
     return 0;
 
     /*

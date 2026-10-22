@@ -51,3 +51,7 @@ set(CMAKE_CXX_STANDARD 23)
 add_executable(ShakTrisTest "test.cpp")
 
 target_link_libraries(ShakTrisTest ShakTris)
+
+add_executable(ShakTrisBench "bench.cpp")
+
+target_link_libraries(ShakTrisBench ShakTris)
