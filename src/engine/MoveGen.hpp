@@ -1618,7 +1618,7 @@ namespace Shaktris {
             // about 1.25x faster with gcc on zen 5, but about 1.13x slower with clang (cause unknown), so gcc only by default
 #if !defined(__clang__)
             template <>
-            constexpr bool use_packed16<ColBoard512> = true;
+            inline constexpr bool use_packed16<ColBoard512> = true;
 #endif
 
             // the flood with 16 bit columns and two rotations per zmm: rotation r lives in register r / 2 at lanes
